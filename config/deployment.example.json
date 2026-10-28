@@ -1,0 +1,6 @@
+{
+  "agentdesktopVersion": "0.6.0",
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "clientId": "00000000-0000-0000-0000-000000000000",
+  "gatewayUrl": "https://gateway.example.com"
+}

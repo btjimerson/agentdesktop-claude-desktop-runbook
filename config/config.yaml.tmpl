@@ -1,0 +1,33 @@
+# Agent Desktop device configuration for Claude Desktop in first-party
+# ("intercept") mode. Rendered by windows/Build-IntuneWinPackage.ps1 and
+# macos/render-macos-script.sh (values come from deployment.json).
+#
+# Claude Desktop stays signed in to claude.ai. Its claude.ai and
+# api.anthropic.com traffic is pinned (egressProxyUrl) to the local intercept
+# listener, which forwards it to the gateway with an Entra ID access token.
+
+daemon:
+  # Re-apply the configuration periodically so a deleted or edited managed
+  # setting (registry policy / managed preferences plist) is repaired.
+  reconcileInterval: 15m
+
+llmGateway:
+  # Must be HTTPS. Requests carry claude.ai cookies and tokens.
+  url: @@GATEWAY_URL@@
+  authentication:
+    type: oidc
+    issuer: https://login.microsoftonline.com/@@TENANT_ID@@/v2.0
+    clientId: @@CLIENT_ID@@
+    redirectUri: http://127.0.0.1:51327/callback
+    # The gateway validates the ACCESS token, so request the API scope that
+    # New-EntraApp.ps1 exposes. Without it Entra issues a Microsoft Graph
+    # token that the gateway cannot validate.
+    scopes:
+      - openid
+      - offline_access
+      - api://@@CLIENT_ID@@/access_as_user
+
+programs:
+  claudeDesktop:
+    gatewayMode: intercept
+    useLlmGateway: true

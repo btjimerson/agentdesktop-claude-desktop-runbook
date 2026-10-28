@@ -1,0 +1,83 @@
+#!/bin/bash
+# Agent Desktop setup for Claude Desktop intercept mode (macOS).
+# Intune shell script: run as root, every 15 minutes, max 3 retries.
+# Idempotent: writes the config when it changed, restarts the daemon only then,
+# and trusts the per-device intercept CA in the System keychain.
+# Rendered from agentdesktop-setup.sh.tmpl by render-macos-script.sh.
+set -u
+
+EXPECTED_VERSION='@@VERSION@@'
+APP='/Applications/agentdesktop.app'
+CONFIG_DIR='/etc/agentdesktop'
+CONFIG="$CONFIG_DIR/config.yaml"
+CA_PEM='/var/lib/agentdesktop/intercept-ca.pem'
+LABEL='dev.agentdesktop.daemon'
+LOG='/var/log/agentdesktop-intune.log'
+CA_NAME='agentdesktop intercept CA'
+
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
+
+# The PKG is deployed by Intune as a macOS app. Until it lands, exit non-zero
+# so Intune retries.
+if [ ! -d "$APP" ]; then log "Agent Desktop is not installed yet"; exit 1; fi
+installed=$("$APP/Contents/MacOS/agentdesktop" --version 2>/dev/null | awk '{print $2}')
+if [ "$installed" != "$EXPECTED_VERSION" ]; then
+  log "installed version '$installed', expected $EXPECTED_VERSION (the PKG may still be updating)"
+  exit 1
+fi
+
+NEW_CONFIG=$(mktemp)
+trap 'rm -f "$NEW_CONFIG"' EXIT
+cat >"$NEW_CONFIG" <<'AGENTDESKTOP_CONFIG'
+@@CONFIG@@
+AGENTDESKTOP_CONFIG
+
+# 1. Configuration.
+changed=0
+/usr/bin/install -d -o root -g wheel -m 0755 "$CONFIG_DIR"
+if ! cmp -s "$NEW_CONFIG" "$CONFIG"; then
+  /usr/bin/install -o root -g wheel -m 0600 "$NEW_CONFIG" "$CONFIG" || { log "could not write $CONFIG"; exit 1; }
+  changed=1
+  log "wrote $CONFIG"
+fi
+if [ "$changed" = 1 ]; then
+  /bin/launchctl kickstart -k "system/$LABEL" || { log "could not restart $LABEL"; exit 1; }
+fi
+
+# 2. Wait for the daemon to create the CA.
+for _ in $(seq 1 40); do [ -f "$CA_PEM" ] && break; sleep 3; done
+[ -f "$CA_PEM" ] || { log "daemon did not create $CA_PEM"; exit 1; }
+
+# 3. Only trust the constrained CA the daemon generates.
+subject=$(/usr/bin/openssl x509 -in "$CA_PEM" -noout -subject 2>/dev/null)
+case "$subject" in *"$CA_NAME"*) ;; *) log "unexpected CA subject: $subject"; exit 1 ;; esac
+if ! /usr/bin/openssl x509 -in "$CA_PEM" -noout -text 2>/dev/null | grep -q 'X509v3 Name Constraints'; then
+  log "CA has no Name Constraints; not trusting"; exit 1
+fi
+if ! /usr/bin/openssl x509 -in "$CA_PEM" -noout -checkend 0 >/dev/null; then
+  log "CA expired; remove $CA_PEM and restart the daemon to regenerate"; exit 1
+fi
+sha1=$(/usr/bin/openssl x509 -in "$CA_PEM" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')
+
+# 4. Remove superseded intercept CAs, then trust the current one.
+/usr/bin/security find-certificate -a -c "$CA_NAME" -Z /Library/Keychains/System.keychain 2>/dev/null |
+  awk '/^SHA-1 hash:/ {print $3}' | while read -r old; do
+    if [ "$old" != "$sha1" ]; then
+      /usr/bin/security delete-certificate -Z "$old" /Library/Keychains/System.keychain && log "removed stale CA $old"
+    fi
+  done
+if ! /usr/bin/security verify-cert -c "$CA_PEM" >/dev/null 2>&1; then
+  /usr/bin/security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CA_PEM" \
+    || { log "could not trust the CA"; exit 1; }
+  log "trusted intercept CA $sha1"
+fi
+
+# 5. Let the console user reach the daemon socket (PKG already adds existing users).
+console_user=$(/usr/bin/stat -f '%Su' /dev/console)
+case "$console_user" in ""|root|loginwindow|_mbsetupuser) ;; *)
+  /usr/sbin/dseditgroup -q -o checkmember -m "$console_user" agentdesktop >/dev/null 2>&1 \
+    || /usr/sbin/dseditgroup -q -o edit -a "$console_user" -t user agentdesktop ;;
+esac
+
+log "ok (CA $sha1, config changed=$changed). Restart Claude Desktop to use the proxy."
+exit 0

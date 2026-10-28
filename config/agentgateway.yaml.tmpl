@@ -1,0 +1,61 @@
+# agentgateway routes for Claude Desktop intercept mode (agentdesktop v0.6.0,
+# PR #194). Values come from harness/offline/run-offline-checks.sh or your own render.
+#
+# TLS: the daemon refuses a plain-HTTP gateway except on loopback. In production
+# terminate TLS in front of agentgateway (load balancer / ingress) or with your
+# existing agentgateway listener configuration, and set llmGateway.url to that
+# HTTPS address. This file carries only the routes and policies.
+#
+# Logs: the gateway sees claude.ai cookies and tokens. Keep sensitiveHeaders.
+config:
+  sensitiveHeaders: [cookie, set-cookie, authorization, x-agentdesktop-identity]
+gateways:
+  local:
+    port: @@GATEWAY_PORT@@
+    bindAddress: @@BIND_ADDRESS@@
+    protocol: HTTP
+routes:
+- name: claude-ai
+  gateways: local
+  hostnames: [claude.ai]
+  policies:
+    jwtAuth:
+      mode: strict            # the default mode lets tokenless requests through
+      location:
+        header:
+          name: x-agentdesktop-identity
+          prefix: "Bearer "   # without it every request gets a 401
+      issuer: https://login.microsoftonline.com/@@TENANT_ID@@/v2.0
+      audiences: [@@CLIENT_ID@@]
+      jwks:
+        url: @@JWKS_URL@@
+    requestHeaderModifier:
+      remove: [x-agentdesktop-identity]
+  backends:
+  - host: claude.ai:443
+    policies:
+      backendTLS:
+        hostname: claude.ai
+        alpn: ["http/1.1"]    # lets WebSocket upgrades work upstream
+- name: anthropic-api
+  gateways: local
+  hostnames: [api.anthropic.com]
+  policies:
+    jwtAuth:
+      mode: strict
+      location:
+        header:
+          name: x-agentdesktop-identity
+          prefix: "Bearer "
+      issuer: https://login.microsoftonline.com/@@TENANT_ID@@/v2.0
+      audiences: [@@CLIENT_ID@@]
+      jwks:
+        url: @@JWKS_URL@@
+    requestHeaderModifier:
+      remove: [x-agentdesktop-identity]
+  backends:
+  - host: api.anthropic.com:443
+    policies:
+      backendTLS:
+        hostname: api.anthropic.com
+        alpn: ["http/1.1"]
